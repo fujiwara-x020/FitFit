@@ -6,9 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.fitfit"
-    compileSdk {
-        version = release(36)
-    }
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.fitfit"
@@ -57,4 +55,13 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+
+
+    // ▼▼▼【ここから追加した部分】▼▼▼
+    // 画面遷移(Navigation)を使うために必要
+    implementation("androidx.navigation:navigation-compose:2.8.0")
+    // 拡張アイコン(SettingsやMonitorHeartなど)を使うために必要
+    implementation("androidx.compose.material:material-icons-extended:1.7.0")
+    // ▲▲▲【追加ここまで】▲▲▲
 }
