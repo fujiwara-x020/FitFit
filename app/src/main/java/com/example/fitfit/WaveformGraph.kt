@@ -4,42 +4,42 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 
 @Composable
-fun WaveformGraph() {
-    val points = remember { mutableStateListOf<Float>() }
-
-    LaunchedEffect(Unit) {
-        repeat(50) { points.add(0f) }
-        while (isActive) {
-            delay(16)
-            points.removeAt(0)
-            val base = (Math.random() - 0.5) * 10
-            val spike = if (Math.random() > 0.9) (Math.random() - 0.5) * 50 else 0.0
-            points.add((base + spike).toFloat())
-        }
-    }
-
+fun WaveformGraph(
+    dataPoints: List<Float>
+) {
     Canvas(
         modifier = Modifier
             .fillMaxSize()
-            .graphicsLayer { alpha = 0.4f }
+            .clipToBounds() // 【修正】描画領域外を切り取る
+            .graphicsLayer { alpha = 0.6f } // 少し薄くしてタイマーを見やすくする
     ) {
+        if (dataPoints.isEmpty()) return@Canvas
+
         val width = size.width
         val height = size.height
         val centerY = height / 2
-        val stepX = width / points.size
+
+        // 【修正】倍率を調整 (以前は5fで大きすぎたので、1.5fくらいに抑える)
+        // BITalinoのデータは0-1023。中心は512。
+        val scaleY = height / 1024f * 1.5f
 
         val path = Path()
-        points.forEachIndexed { index, value ->
+        // X軸のステップ幅
+        val stepX = width / (dataPoints.size.coerceAtLeast(1) - 1).toFloat()
+
+        dataPoints.forEachIndexed { index, value ->
+            // 512を中心として、上下に振幅させる
+            val normalizedY = centerY - ((value - 512f) * scaleY)
             val x = index * stepX
-            val y = centerY + value
+            val y = normalizedY
+
             if (index == 0) {
                 path.moveTo(x, y)
             } else {

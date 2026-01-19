@@ -56,8 +56,6 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
-
-
     // ▼▼▼【ここから追加した部分】▼▼▼
     // 画面遷移(Navigation)を使うために必要
     implementation("androidx.navigation:navigation-compose:2.8.0")

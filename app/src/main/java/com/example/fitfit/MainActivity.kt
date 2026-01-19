@@ -31,8 +31,8 @@ fun FitFitApp() {
         if (isSplash) {
             MyofluxSplashScreen()
         } else {
-            // 【修正箇所】ここで macAddress 引数を渡す必要があります
-            MainScreen(macAddress = "20:16:07:18:14:56")
+            // 【修正完了】引数名を変更済み
+            MainScreen(initialMacAddress = "20:16:07:18:14:56")
         }
     }
 }

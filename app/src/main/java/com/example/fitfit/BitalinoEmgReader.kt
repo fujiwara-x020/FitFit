@@ -6,170 +6,153 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.IOException
 import java.util.UUID
-import kotlin.experimental.and
 
-/**
- * BITalino SDKを使用せず、Raw Bluetooth Socket (RFCOMM) で
- * 直接コマンドを送信し、バイナリデータを解析するクラス。
- */
 class BitalinoEmgReader(
     private val context: Context,
-    private val macAddress: String,
-    private val samplingRate: Int = 1000,
-    // BITalinoのアナログチャンネル (A1=0, A2=1, ...)。
-    // ※ Raw通信の場合、有効にするチャンネルビットマスクの計算に使用します。
-    private val channelIndex: Int = 0
-) {
-
+    private val macAddress: String
+) : EmgReader {
     private var bluetoothSocket: BluetoothSocket? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
-
-    // SPP (Serial Port Profile) UUID
     private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-    /**
-     * Bluetooth接続
-     */
     @SuppressLint("MissingPermission")
-    suspend fun connect() = withContext(Dispatchers.IO) {
+    override suspend fun connect() {
+        withContext(Dispatchers.IO) {
+        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = manager.adapter ?: throw Exception("Bluetooth not supported")
+        val device = adapter.getRemoteDevice(macAddress)
+
+        Log.d("BITalinoRaw", "Connecting to $macAddress...")
         try {
-            val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-            val adapter = manager.adapter
-
-            if (adapter == null || !adapter.isEnabled) {
-                throw Exception("Bluetooth is disabled or not supported.")
+            val tmpSocket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            tmpSocket.connect()
+            bluetoothSocket = tmpSocket
+        } catch (e1: IOException) {
+            try {
+                val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                val tmpSocket = m.invoke(device, 1) as BluetoothSocket
+                tmpSocket.connect()
+                bluetoothSocket = tmpSocket
+            } catch (e2: Exception) {
+                throw IOException("Connection failed", e2)
             }
-
-            val device = adapter.getRemoteDevice(macAddress)
-            // BITalinoはInsecure接続推奨
-            val socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
-
-            Log.d("BITalinoRaw", "Connecting to $macAddress...")
-            socket.connect()
-
-            bluetoothSocket = socket
-            inputStream = socket.inputStream
-            outputStream = socket.outputStream
-
-            // 接続後、デバイスが安定するまで少し待つ（推奨）
-            Thread.sleep(1000)
-
-            Log.d("BITalinoRaw", "Connected via Raw RFCOMM.")
-
-        } catch (e: Exception) {
-            Log.e("BITalinoRaw", "Connection failed", e)
-            close()
-            throw e
         }
+        bluetoothSocket?.let {
+            inputStream = it.inputStream
+            outputStream = it.outputStream
+        }
+        Thread.sleep(1500)
+    }
     }
 
-    /**
-     * 指定秒数計測し、EMG値(Float)のリストを返す
-     */
-    suspend fun readEmgForSeconds(durationSec: Int): List<Float> = withContext(Dispatchers.IO) {
-        if (bluetoothSocket == null || outputStream == null || inputStream == null) {
-            throw IllegalStateException("Device not connected.")
-        }
-
-        val results = mutableListOf<Float>()
+    override suspend fun readEmgForSeconds(
+        durationSec: Int,
+        onDataReceived: ((Float) -> Unit)?
+    ) {
+        withContext(Dispatchers.IO) {
+        if (bluetoothSocket == null) throw IllegalStateException("Device not connected.")
 
         try {
-            // --- 1. 計測開始コマンドの送信 ---
-            // BITalinoプロトコル仕様に基づくコマンド生成
-            // Sampling Rate: 1000Hz (コード: 0x3)
-            // Command = <SamplingRate 2bit> <AnalogChannels 4bit> <Mode 1bit(1=Start)> <Reserve 1bit>
-            // ※ ここでは簡易的に、よく使われるサンプリングレート設定とチャンネルマスクを送信します。
+            // 【変更1】Java SDKと同じ手順でコマンドを送る
+            // 1. サンプリングレート設定 (100Hz = 0x02)
+            //    Command: (0x02 << 6) | 0x03 = 0x83
+            outputStream?.write(0x83)
+            Thread.sleep(100)
 
-            // 例: サンプリングレート1000Hz=0xB (設定による), A1有効化など
-            // 一般的なBITalino Startコマンド (Live Mode, 全チャンネル有効など)
-            // バイト値はファームウェアバージョンによりますが、0x02 (Start) が基本です。
-            // 詳細に制御する場合: (SamplingRateCode << 6) | 0x01
-
-            // とりあえず "Live Mode Start" を送る (0x02 と想定)
-            // ※必要に応じてビットマスクを変更してください
-            val startCommand = 0x02 // Start acquisition
-            outputStream?.write(startCommand)
+            // 2. 計測開始 (A1チャンネル = 0)
+            //    Command: 1 | (1 << (2 + 0)) = 1 | 4 = 5 (0x05)
+            //    BITalinoDevice.java の start() ロジック準拠
+            outputStream?.write(0x05)
             outputStream?.flush()
-            Log.d("BITalinoRaw", "Start command sent.")
 
-            // --- 2. データ読み取り ---
-            val totalSamples = durationSec * samplingRate
-            var samplesRead = 0
+            Log.d("BITalinoRaw", "Sent Java-SDK Style Start Commands (0x83 -> 0x05)")
 
-            // BITalinoのフレームサイズ計算（バージョンとチャンネル数による）
-            // プロトコルv1.0 (Revolution) の場合、A1-A6すべて有効だと8バイトなど可変。
-            // ここでは簡易的に「ストリームから読みながらシーケンス番号の変化でフレームを区切る」
-            // または「固定バイト数（例: 6バイト）」で読みます。
-            // A1のみの場合、多くは 4~6バイト/フレーム です。ここでは安全策でバイト解析を行います。
+            val endTime = System.currentTimeMillis() + (durationSec * 1000)
 
-            val buffer = ByteArray(1024)
+            // 1chモードは3バイト (Java SDK: ceil((12+10)/8) = 3)
+            val frameLength = 3
+            val buffer = ByteArray(frameLength)
 
-            // タイムアウト用
-            val startTime = System.currentTimeMillis()
-            val timeoutMs = durationSec * 1000 + 2000
+            while (System.currentTimeMillis() < endTime && isActive) {
+                // 3バイト読み込み
+                var bytesRead = 0
+                while (bytesRead < frameLength && isActive) {
+                    val r = inputStream?.read(buffer, bytesRead, frameLength - bytesRead) ?: -1
+                    if (r == -1) break
+                    bytesRead += r
+                }
+                if (bytesRead < frameLength) break
 
-            while (samplesRead < totalSamples) {
-                if (System.currentTimeMillis() - startTime > timeoutMs) break
+                // 【変更2】Java SDK BITalinoFrameDecoder.java のロジックでデコード
+                // buffer[2]: Seq(4bit) + CRC(4bit)
+                // buffer[1]: Dig(4bit) + AnalogHigh(4bit)
+                // buffer[0]: AnalogLow(6bit) + Padding(2bit)
 
-                val available = inputStream?.available() ?: 0
-                if (available > 0) {
-                    val bytesRead = inputStream?.read(buffer) ?: 0
+                if (checkCRC(buffer)) {
+                    // Java SDKの計算式:
+                    // (((buffer[j-1] & 0xF) << 6) | ((buffer[j-2] & 0XFC) >> 2))
+                    // j=2 なので、buffer[1]の下位4bit と buffer[0]の上位6bit を使う
 
-                    // ※ここで本来はCRCチェックやフレーム同期ビットの確認が必要ですが、
-                    // 簡易実装としてバイナリデータをパースします。
+                    val b1 = buffer[1].toInt()
+                    val b0 = buffer[0].toInt()
 
-                    // --- 簡易デコードロジック (BITalino 10bit Unpacking) ---
-                    // 1フレームが数バイトの塊で来ると仮定し、データを抽出
-                    // プロトコル: [SEQ(4b)|DIG(4b)] [A1(10b)...]
-                    // ここでは擬似的にバイト列から数値を拾う処理を書きます。
+                    // 下位4bitを取り出して6bit左へ
+                    val upper = (b1 and 0x0F) shl 6
 
-                    for (i in 0 until bytesRead step 4) { // 4バイトずつ処理の仮定
-                        if (i + 1 < bytesRead) {
-                            // ダミー解析: 上位バイトと下位バイトを組み合わせて値を生成
-                            // 実際はビットシフトが必要です: val sample = ((b1 & 0x0F) << 6) | ((b2 & 0xFC) >> 2) 等
-                            val raw = (buffer[i].toInt() and 0xFF) * 2 + (buffer[i+1].toInt() and 0xFF)
+                    // 上位6bitを取り出して2bit右へ（符号なしシフト）
+                    val lower = (b0 and 0xFC).toUByte().toInt() ushr 2
 
-                            // 0-1023の範囲に収める (10bit)
-                            val cleanValue = (raw % 1024).toFloat()
-                            results.add(cleanValue)
-                            samplesRead++
-                        }
-                    }
+                    val rawValue = upper or lower
+                    val finalValue = (rawValue and 0x03FF).toFloat()
+
+                    onDataReceived?.invoke(finalValue)
                 } else {
-                    // データが来ていない時は少し待つ
-                    Thread.sleep(10)
+                    // CRCエラー時は1バイト空読みして同期ズレを直す
+                    inputStream?.read()
                 }
             }
-
         } catch (e: Exception) {
-            Log.e("BITalinoRaw", "Error reading data", e)
+            Log.e("BITalinoRaw", "Read Error", e)
         } finally {
-            // --- 3. 停止コマンド ---
-            try {
-                val stopCommand = 0x00 // Stop acquisition
-                outputStream?.write(stopCommand)
-                outputStream?.flush()
-            } catch (e: Exception) {
-                // Ignore
+            try { outputStream?.write(0x00) } catch (e: Exception) {}
             }
-        }
-
-        return@withContext results
+    }
     }
 
-    fun close() {
-        try {
-            bluetoothSocket?.close()
-        } catch (e: Exception) {
-            Log.e("BITalinoRaw", "Error closing socket", e)
+    // Java SDK互換のCRCチェック
+    private fun checkCRC(buffer: ByteArray): Boolean {
+        val len = buffer.size
+        // CRCは最後のバイト(buffer[2])の下位4bit
+        val receivedCRC = (buffer[len - 1].toInt() and 0x0F)
+
+        var x0 = 0; var x1 = 0; var x2 = 0; var x3 = 0
+
+        for (i in 0 until len) {
+            val b = buffer[i].toInt()
+            for (bit in 7 downTo 0) {
+                var inp = (b shr bit) and 0x01
+                if (i == (len - 1) && bit < 4) inp = 0
+
+                val out = x3
+                x3 = x2
+                x2 = x1
+                x1 = out xor x0
+                x0 = inp xor out
+            }
         }
+        val calculatedCRC = (x3 shl 3) or (x2 shl 2) or (x1 shl 1) or x0
+        return receivedCRC == calculatedCRC
+    }
+
+    override fun close() {
+        try { bluetoothSocket?.close() } catch (e: Exception) {}
         bluetoothSocket = null
-        inputStream = null
-        outputStream = null
     }
 }
